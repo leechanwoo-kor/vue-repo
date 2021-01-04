@@ -1,0 +1,21 @@
+import Vue from 'vue'
+import Router from 'vue-router'
+import HelloWorld from '@/components/HelloWorld'
+import HelloWorld0 from '@/components/HelloWorld0'
+
+Vue.use(Router)
+
+export default new Router({
+  routes: [
+    {
+      path: '/',
+      name: 'HelloWorld',
+      component: HelloWorld
+    },
+    {
+      path: '/test',
+      name: 'HelloWorld0',
+      component: HelloWorld0
+    }
+  ]
+})
