@@ -3,16 +3,61 @@
 var express  = require('express');
 var router = express.Router();
 var Post = require('../models/Post');
+var User = require('../models/User');
+var Comment = require('../models/Comment');
 var util = require('../util');
 
 // Index
-router.get('/', function(req, res){
-  Post.find({})
-  .populate('author')
-  .sort('-createdAt')
-  .exec(function(err, posts){
-    if(err) return res.json(err);
-    res.render('posts/index', {posts:posts});
+router.get('/', async function(req, res){
+  var page = Math.max(1, parseInt(req.query.page));
+  var limit = Math.max(1, parseInt(req.query.limit));
+  page = !isNaN(page)?page:1;
+  limit = !isNaN(limit)?limit:10;
+
+  var skip = (page-1)*limit;
+  var maxPage = 0;
+  var searchQuery = await createSearchQuery(req.query);
+  var posts = [];
+
+  if(searchQuery) {
+    var count = await Post.countDocuments(searchQuery);
+    maxPage = Math.ceil(count/limit);
+    posts = await Post.aggregate([ // 1
+      { $match: searchQuery }, // 2
+      { $lookup: { // 3
+          from: 'users',
+          localField: 'author',
+          foreignField: '_id',
+          as: 'author'
+      } },
+      { $unwind: '$author' }, // 4
+      { $sort : { createdAt: -1 } }, // 5
+      { $skip: skip }, // 6
+      { $limit: limit }, // 7
+      { $lookup: { // 8
+          from: 'comments',
+          localField: '_id',
+          foreignField: 'post',
+          as: 'comments'
+      } },
+      { $project: { // 9
+          title: 1,
+          author: {
+            username: 1,
+          },
+          createdAt: 1,
+          commentCount: { $size: '$comments'} // 10
+      } },
+    ]).exec();
+  }
+
+  res.render('posts/index', {
+    posts:posts,
+    currentPage:page,
+    maxPage:maxPage,
+    limit:limit,
+    searchType:req.query.searchType,
+    searchText:req.query.searchText
   });
 });
 
@@ -32,17 +77,26 @@ router.post('/', util.isLoggedin, function(req, res){
       req.flash('errors', util.parseError(err));
       return res.redirect('/posts/new');
     }
-    res.redirect('/posts');
+    res.redirect('/posts'+res.locals.getPostQueryString(false, { page:1, searchText:'' }));
   });
 });
 
 // show
-router.get('/:id', function(req, res){
-  Post.findOne({_id:req.params.id})
-    .populate('author')
-    .exec(function(err, post){
-      if(err) return res.json(err);
-      res.render('posts/show', {post:post});
+router.get('/:id', function(req, res){ // 2
+  var commentForm = req.flash('commentForm')[0] || {_id: null, form: {}};
+  var commentError = req.flash('commentError')[0] || { _id:null, parentComment: null, errors:{}};
+
+  Promise.all([
+      Post.findOne({_id:req.params.id}).populate({ path: 'author', select: 'username' }),
+      Comment.find({post:req.params.id}).sort('createdAt').populate({ path: 'author', select: 'username' })
+    ])
+    .then(([post, comments]) => {
+      var commentTrees = util.convertToTrees(comments, '_id','parentComment','childComments');
+      res.render('posts/show', { post:post, commentTrees:commentTrees, commentForm:commentForm, commentError:commentError});
+    })
+    .catch((err) => {
+      console.log('err: ', err);
+      return res.json(err);
     });
 });
 
@@ -85,7 +139,7 @@ router.delete('/:id', util.isLoggedin, checkPermission, function(req, res){
 
 module.exports = router;
 
-// private functions // 1
+// private functions
 function checkPermission(req, res, next){
   Post.findOne({_id:req.params.id}, function(err, post){
     if(err) return res.json(err);
@@ -93,4 +147,33 @@ function checkPermission(req, res, next){
 
     next();
   });
+}
+
+async function createSearchQuery(queries){
+  var searchQuery = {};
+  if(queries.searchType && queries.searchText && queries.searchText.length >= 3){
+    var searchTypes = queries.searchType.toLowerCase().split(',');
+    var postQueries = [];
+    if(searchTypes.indexOf('title')>=0){
+      postQueries.push({ title: { $regex: new RegExp(queries.searchText, 'i') } });
+    }
+    if(searchTypes.indexOf('body')>=0){
+      postQueries.push({ body: { $regex: new RegExp(queries.searchText, 'i') } });
+    }
+    if(searchTypes.indexOf('author!')>=0){ // 2-1
+      var user = await User.findOne({ username: queries.searchText }).exec();
+      if(user) postQueries.push({author:user._id});
+    }
+    else if(searchTypes.indexOf('author')>=0){ // 2-2
+      var users = await User.find({ username: { $regex: new RegExp(queries.searchText, 'i') } }).exec();
+      var userIds = [];
+      for(var user of users){
+        userIds.push(user._id);
+      }
+      if(userIds.length>0) postQueries.push({author:{$in:userIds}});
+    }
+    if(postQueries.length>0) searchQuery = {$or:postQueries}; // 2-3
+    else searchQuery = null;                                  // 2-3
+  }
+  return searchQuery;
 }
